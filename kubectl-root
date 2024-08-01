@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+
+[[ -n "${DEBUG}" ]] && set -x
+set -eo pipefail
+
+KROOT_NAMESPACE="${KROOT_NAMESPACE:-default}"
+KROOT_SHELL="${KROOT_SHELL:-sh}"
+KROOT_CRICTL_BIN=${KROOT_CRICTL_BIN:-/usr/local/bin/crictl}
+KROOT_RUNC_BIN=${KROOT_RUNC_BIN:-/var/lib/rancher/rke2/bin/runc}
+KROOT_RUNC_ROOT=${KROOT_RUNC_ROOT:-/run/containerd/runc/k8s.io}
+
+### show help message and exit
+# arg: none
+show_help() {
+  cat << EOF
+kubectl root helps exec into non-root containers as root
+
+Usage:
+  kubectl root <pod> [-c <string>] [-n <string>] [-h]
+
+Flags:
+  -c, --container string    specify container name
+  -n, --namespace string    set namespace scope
+  -h, --help                show this message
+EOF
+  exit
+}
+
+### show an error message and exit
+# arg: $1 - text
+err() {
+  echo "🮲 error: $1" >&2
+  exit 1
+}
+
+### parse and validate the input
+# arg: $@ - arguments
+# set: POD, CONTAINER
+parse_input() {
+  while (( "$#" )); do
+    case "$1" in
+      -n|--namespace) if [[ -n "$2" ]] && [[ "${2:0:1}" != "-" ]]; then
+                        KROOT_NAMESPACE="$2"; shift 2
+                      else
+                        err "option $1 requires an argument"
+                      fi
+                      ;;
+      -c|--container) if [[ -n "$2" ]] && [[ "${2:0:1}" != "-" ]]; then
+                        CONTAINER="$2"; shift 2
+                      else
+                        err "option $1 requires an argument"
+                      fi
+                      ;;
+      -h|--help)      show_help
+                      ;;
+      -*|--*)         err "invalid option: $1"
+                      ;;
+      *)              if [[ -z "${POD}" ]]; then
+                        POD="$1"; shift
+                      else
+                        err "multiple pods provided"
+                      fi
+                      ;;
+    esac
+  done
+  [[ -n "${POD}" ]] || err "no pod provided"
+}
+
+main() {
+  local node containers container_id
+
+  parse_input "$@"
+
+  node=$(kubectl --namespace "${KROOT_NAMESPACE}" get pod "${POD}" --output jsonpath='{.spec.nodeName}')
+
+  ssh ${KROOT_SSH_OPT} -t "${node}" '
+    container=$(sudo '"${KROOT_CRICTL_BIN}"' ps --label io.kubernetes.pod.name='"${POD}"' --name '"${CONTAINER:-.}"' --no-trunc | awk "!/CONTAINER/ {print \$1}")
+    if [[ "$(wc -l <<< "${container}")" -gt 1 ]]; then
+      echo "🮲 error: use -c option to specify the container" >&2
+      exit 1
+    fi
+    sudo '"${KROOT_RUNC_BIN}"' --root '"${KROOT_RUNC_ROOT}"' exec --tty --user 0:0 "${container}" '"${KROOT_SHELL}"'
+  '
+}
+
+main "$@"
